@@ -207,7 +207,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     )
 
     case event_type do
-      "response.output_text.delta" ->
+      type when type in @text_delta_events ->
         text = data["delta"] || ""
         if text == "", do: [], else: [ReqLLM.StreamChunk.text(text)]
 
@@ -258,13 +258,6 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
         [ReqLLM.StreamChunk.meta(%{usage: usage, model: model.id})]
 
       "response.output_text.done" ->
-        []
-
-      "response.refusal.delta" ->
-        text = data["delta"] || ""
-        if text == "", do: [], else: [ReqLLM.StreamChunk.text(text)]
-
-      "response.refusal.done" ->
         []
 
       "response.output_text.annotation.added" ->
@@ -362,14 +355,9 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   end
 
   defp decode_output_or_terminal_event("response.completed", data, model) do
-    finish_reason =
-      if extract_refusals_from_segments(get_in(data, ["response", "output"])) == [],
-        do: :stop,
-        else: :content_filter
-
     capture_completion_metadata(
       data,
-      %{terminal?: true, finish_reason: finish_reason},
+      %{terminal?: true, finish_reason: :stop},
       model.provider
     )
   end
@@ -474,6 +462,9 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     [ReqLLM.StreamChunk.meta(meta)]
   end
 
+  # A refusal completes with status "completed", so a `:stop` finish reason is
+  # upgraded to `:content_filter` here, the way `ResponseBuilder` upgrades
+  # `:stop` to `:tool_calls`.
   defp merge_refusals_meta(meta, response_output) do
     case extract_refusals_from_segments(response_output) do
       [] ->
@@ -481,9 +472,15 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
       refusals ->
         provider_meta = Map.get(meta, :provider_meta, %{})
-        Map.put(meta, :provider_meta, put_refusals_meta(provider_meta, refusals))
+
+        meta
+        |> Map.put(:provider_meta, put_refusals_meta(provider_meta, refusals))
+        |> Map.replace_lazy(:finish_reason, &refusal_finish_reason/1)
     end
   end
+
+  defp refusal_finish_reason(:stop), do: :content_filter
+  defp refusal_finish_reason(finish_reason), do: finish_reason
 
   # The incremental `response.output_text.annotation.added` chunks are
   # event-only; the completed/incomplete response's full output is the
@@ -1834,7 +1831,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp message_item_text(%{content: content}) when is_list(content) do
     content
-    |> Enum.filter(&((Map.get(&1, :type) || Map.get(&1, "type")) in ["output_text", "text"]))
+    |> Enum.filter(&((Map.get(&1, :type) || Map.get(&1, "type")) in @message_text_types))
     |> Enum.map_join("", &extract_text_field/1)
   end
 
@@ -2283,15 +2280,21 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
     usage = normalize_responses_usage(base_usage, body)
 
+    refusals = extract_refusals_from_segments(output_segments)
+
     finish_reason =
-      determine_finish_reason(body, Enum.reject(tool_calls, &ReqLLM.ToolCall.builtin?/1))
+      determine_finish_reason(
+        body,
+        Enum.reject(tool_calls, &ReqLLM.ToolCall.builtin?/1),
+        refusals
+      )
 
     message_metadata =
       body["id"]
       |> build_message_metadata(output_segments)
       |> put_compaction_replay(output_segments, model.provider)
 
-    {object, object_meta} = maybe_extract_object(req, text, tool_calls) || {nil, %{}}
+    {object, object_meta} = maybe_extract_object(req, text, tool_calls, refusals) || {nil, %{}}
 
     # Stamp `api_type` so Azure Responses (which calls this decoder
     # directly via `Azure.ResponsesAPI.parse_response/3`, bypassing the
@@ -2308,7 +2311,7 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
       |> Map.merge(object_meta)
       |> put_code_interpreter_meta(code_interpreter_items)
       |> put_annotations_meta(extract_annotations_from_segments(output_segments))
-      |> put_refusals_meta(extract_refusals_from_segments(output_segments))
+      |> put_refusals_meta(refusals)
 
     ctx = req.options[:context] || %ReqLLM.Context{messages: []}
     text_chunks = buffered_text_chunks(text, output_segments)
@@ -2459,7 +2462,9 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
     |> Map.merge(extract_assistant_phase_metadata(output_segments))
   end
 
-  defp maybe_extract_object(req, text, tool_calls) do
+  defp maybe_extract_object(_req, _text, _tool_calls, [_ | _]), do: nil
+
+  defp maybe_extract_object(req, text, tool_calls, _refusals) do
     case req.options[:operation] do
       :object ->
         compiled_schema = req.options[:compiled_schema]
@@ -2648,7 +2653,10 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   defp extract_text_field(%{"text" => text}) when is_binary(text), do: text
   defp extract_text_field(%{"content" => content}) when is_binary(content), do: content
-  defp extract_text_field(%{"refusal" => refusal}) when is_binary(refusal), do: refusal
+
+  defp extract_text_field(%{"type" => "refusal", "refusal" => refusal}) when is_binary(refusal),
+    do: refusal
+
   defp extract_text_field(_), do: ""
 
   defp normalize_phase_item_content(content) when is_list(content) do
@@ -2903,11 +2911,11 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
 
   # The Responses API returns "completed" status even when the model refused or
   # called tools, so both are read from the output instead.
-  defp determine_finish_reason(body, tool_calls) do
+  defp determine_finish_reason(body, tool_calls, refusals) do
     case body["status"] do
       "completed" ->
         cond do
-          extract_refusals_from_segments(body["output"]) != [] -> :content_filter
+          refusals != [] -> :content_filter
           tool_calls != [] -> :tool_calls
           true -> :stop
         end

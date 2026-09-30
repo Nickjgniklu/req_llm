@@ -1289,6 +1289,57 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
       assert ReqLLM.Response.refusals(resp.body) == [refusal]
     end
 
+    test "a refusal takes precedence over tool calls for the finish reason" do
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "status" => "completed",
+        "output" => [
+          refusal_message_item("msg_1", "I can't help with that."),
+          %{
+            "type" => "function_call",
+            "call_id" => "call_1",
+            "name" => "lookup",
+            "arguments" => ~s({"q":"docs"})
+          }
+        ],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      {_req, resp} = ResponsesAPI.decode_response(build_response(200, response_body))
+
+      assert resp.body.finish_reason == :content_filter
+    end
+
+    test "generate_object with a refusal skips object extraction" do
+      {:ok, compiled_schema} = ReqLLM.Schema.compile(name: [type: :string, required: true])
+      refusal = "I'm sorry, I can't help with that."
+
+      response_body = %{
+        "id" => "resp_123",
+        "model" => "gpt-5",
+        "status" => "completed",
+        "output" => [refusal_message_item("msg_1", refusal)],
+        "usage" => %{"input_tokens" => 5, "output_tokens" => 10}
+      }
+
+      req = %Req.Request{
+        method: :post,
+        url: URI.parse("https://api.openai.com/v1/responses"),
+        headers: %{},
+        body: {:json, %{}},
+        options: %{id: "gpt-5", operation: :object, compiled_schema: compiled_schema}
+      }
+
+      resp = %Req.Response{status: 200, headers: %{}, body: response_body}
+
+      {_req, decoded_resp} = ResponsesAPI.decode_response({req, resp})
+
+      assert %ReqLLM.Response{object: nil, finish_reason: :content_filter} = decoded_resp.body
+      refute Map.has_key?(decoded_resp.body.provider_meta, :object_parse_error)
+      assert ReqLLM.Response.refusals(decoded_resp.body) == [refusal]
+    end
+
     test "decodes a phased refusal as text with the phase" do
       refusal = "I can't help with that."
 
@@ -2887,6 +2938,57 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
 
       assert metadata.finish_reason == :stop
       refute Map.has_key?(metadata[:provider_meta] || %{}, "refusals")
+    end
+
+    test "response.incomplete with a refusal keeps its finish reason", %{model: model} do
+      event = %{
+        data: %{
+          "type" => "response.incomplete",
+          "response" => %{
+            "id" => "resp_1",
+            "status" => "incomplete",
+            "incomplete_details" => %{"reason" => "max_output_tokens"},
+            "output" => [refusal_message_item("msg_1", "I can't help")]
+          }
+        }
+      }
+
+      assert [%ReqLLM.StreamChunk{type: :meta, metadata: metadata}] =
+               ResponsesAPI.decode_stream_event(event, model)
+
+      assert metadata.finish_reason == :length
+      assert metadata.provider_meta["refusals"] == ["I can't help"]
+    end
+
+    test "stateful decoding stamps the message phase on refusal deltas", %{model: model} do
+      item =
+        "msg_1"
+        |> refusal_message_item("I can't help with that.")
+        |> Map.put("phase", "final_answer")
+
+      events = [
+        %{
+          "type" => "response.output_item.added",
+          "output_index" => 0,
+          "item" => Map.merge(item, %{"status" => "in_progress", "content" => []})
+        },
+        %{
+          "type" => "response.refusal.delta",
+          "item_id" => "msg_1",
+          "output_index" => 0,
+          "content_index" => 0,
+          "delta" => "I can't help with that."
+        },
+        %{"type" => "response.output_item.done", "output_index" => 0, "item" => item}
+      ]
+
+      assert [
+               %ReqLLM.StreamChunk{
+                 type: :content,
+                 text: "I can't help with that.",
+                 metadata: %{phase: "final_answer", output_index: 0}
+               }
+             ] = decode_stream_events(events, model)
     end
 
     test "stateful decoding streams a refusal once and ends with content_filter", %{
@@ -4495,6 +4597,59 @@ defmodule Provider.OpenAI.ResponsesAPIUnitTest do
 
       assert response.finish_reason == :tool_calls
       assert [%ReqLLM.ToolCall{function: %{name: "get_weather"}}] = response.message.tool_calls
+    end
+
+    test "keeps a streamed refusal's content_filter finish reason when tool chunks are present" do
+      {:ok, model} = ReqLLM.model("openai:gpt-5")
+      context = %ReqLLM.Context{messages: []}
+
+      refusal_item = refusal_message_item("msg_1", "I can't help with that.")
+
+      function_item = %{
+        "type" => "function_call",
+        "call_id" => "call_1",
+        "name" => "lookup",
+        "arguments" => ~s({"q":"docs"})
+      }
+
+      events = [
+        %{
+          "type" => "response.refusal.delta",
+          "output_index" => 0,
+          "content_index" => 0,
+          "delta" => "I can't help with that."
+        },
+        %{"type" => "response.output_item.done", "output_index" => 1, "item" => function_item},
+        %{
+          "type" => "response.completed",
+          "response" => %{
+            "id" => "resp_1",
+            "status" => "completed",
+            "output" => [refusal_item, function_item]
+          }
+        }
+      ]
+
+      {chunks, _state} =
+        Enum.flat_map_reduce(events, nil, fn data, state ->
+          ResponsesAPI.decode_stream_event(%{data: data}, model, state)
+        end)
+
+      {terminal, content_chunks} = List.pop_at(chunks, -1)
+
+      assert %ReqLLM.StreamChunk{type: :meta, metadata: %{finish_reason: :content_filter}} =
+               terminal
+
+      {:ok, response} =
+        ResponseBuilder.build_response(
+          content_chunks,
+          %{finish_reason: terminal.metadata.finish_reason},
+          context: context,
+          model: model
+        )
+
+      assert response.finish_reason == :content_filter
+      assert [%ReqLLM.ToolCall{function: %{name: "lookup"}}] = response.message.tool_calls
     end
 
     test "preserves stop finish reason when only builtin tool chunks are present" do
