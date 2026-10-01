@@ -2844,14 +2844,11 @@ defmodule ReqLLM.Providers.OpenAI.ResponsesAPI do
   end
 
   defp extract_refusals_from_segments(segments) when is_list(segments) do
-    segments
-    |> Enum.filter(&(is_map(&1) and &1["type"] == "message"))
-    |> ReqLLM.Providers.OpenAI.MultiAgent.rendered_items()
-    |> Enum.flat_map(fn seg ->
-      for %{"type" => "refusal", "refusal" => refusal} <- seg["content"] || [],
-          is_binary(refusal) and refusal != "",
-          do: refusal
-    end)
+    for %{"type" => "message"} = segment <- segments,
+        ReqLLM.Providers.OpenAI.MultiAgent.root_item?(segment),
+        %{"type" => "refusal", "refusal" => refusal} <- segment["content"] || [],
+        is_binary(refusal) and refusal != "",
+        do: refusal
   end
 
   defp extract_refusals_from_segments(_), do: []

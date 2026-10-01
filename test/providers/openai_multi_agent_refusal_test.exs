@@ -64,6 +64,15 @@ defmodule ReqLLM.Providers.OpenAIMultiAgentRefusalTest do
     assert response.message.metadata.responses_replay.items == data.body["output"]
   end
 
+  test "done items retain the root answer when no deltas arrive", data do
+    response = streamed_response(data, :done_only)
+
+    assert ReqLLM.Response.text(response) == ~s({"name":"Alice"})
+    assert response.finish_reason == :stop
+    assert ReqLLM.Response.refusals(response) == []
+    assert response.message.metadata.responses_replay.items == data.body["output"]
+  end
+
   test "buffered and streamed root refusals still report content_filter", data do
     refusal = "I cannot answer the root request."
     [child, root] = data.body["output"]
@@ -99,12 +108,17 @@ defmodule ReqLLM.Providers.OpenAIMultiAgentRefusalTest do
     response.body
   end
 
-  defp streamed_response(data) do
+  defp streamed_response(data, mode \\ :deltas) do
     events =
       data.body["output"]
       |> Enum.with_index()
-      |> Enum.map(fn {item, index} ->
-        %{"type" => "response.output_item.done", "output_index" => index, "item" => item}
+      |> Enum.flat_map(fn {item, index} ->
+        done = %{"type" => "response.output_item.done", "output_index" => index, "item" => item}
+
+        case mode do
+          :deltas -> message_delta_events(item, index) ++ [done]
+          :done_only -> [done]
+        end
       end)
 
     events = events ++ [%{"type" => "response.completed", "response" => data.body}]
@@ -121,5 +135,22 @@ defmodule ReqLLM.Providers.OpenAIMultiAgentRefusalTest do
       )
 
     response
+  end
+
+  defp message_delta_events(%{"content" => [part]} = item, index) do
+    type = part["type"]
+    added_item = Map.merge(item, %{"status" => "in_progress", "content" => []})
+
+    [
+      %{"type" => "response.output_item.added", "output_index" => index, "item" => added_item},
+      %{
+        "type" => "response.#{type}.delta",
+        "item_id" => item["id"],
+        "output_index" => index,
+        "content_index" => 0,
+        "agent" => item["agent"],
+        "delta" => part["refusal"] || part["text"]
+      }
+    ]
   end
 end
